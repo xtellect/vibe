@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 static volatile bool running = true;
-void sig_handler(int s) { running = false; }
+void sig_handler(int s) { (void)s; running = false; }
 
 #define MAX_USERS 1024
 
@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
                         break;
 
                     case VIBE_EVENT_DATA:
-                        // 4. Zero-Copy Broadcast to all users
+                        // 4. Single-Copy Broadcast to all users
                         // The engine handles the reference counting!
                         vibe_multicast(users, user_count, msg->data, msg->len);
                         break;
