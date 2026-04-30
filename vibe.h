@@ -1030,6 +1030,8 @@ struct vibe_connection {
   struct vibe_queue_injector outbox;
   atomic_size_t pending_bytes;
   vibe_node_t* partial_msg;
+  vibe_node_t* partial_read_msg;
+  uint32_t partial_read_idx;
   uint32_t read_idx;
   uint8_t read_buf[VIBE_READ_BUFFER_SIZE];
   vibe_hub_t* ctx;
@@ -1050,11 +1052,19 @@ static void vibe_conn_retain(vibe_conn_t* conn) {
   atomic_fetch_add_explicit(&conn->ref_count, 1, memory_order_relaxed);
 }
 
+static void vibe_free_node(vibe_node_t* node);
+static void vibe_chunk_release(vibe_chunk_t* chunk);
+
 static void vibe_conn_release(vibe_conn_t* conn) {
   if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) ==
       1) {
     atomic_thread_fence(memory_order_acquire);
     if (conn->fd >= 0) close(conn->fd);
+    if (conn->partial_read_msg) vibe_free_node(conn->partial_read_msg);
+    if (conn->partial_msg) {
+      if (conn->partial_msg->out.chunk) vibe_chunk_release(conn->partial_msg->out.chunk);
+      vibe_free_node(conn->partial_msg);
+    }
     free(conn);
   }
 }
@@ -1222,57 +1232,84 @@ static void vibe_handle_write(vibe_conn_t* conn) {
 }
 
 static void vibe_handle_read(vibe_conn_t* conn, struct vibe_queue_list* batch) {
+  bool grabbed_data = false;
   while (true) {
-    ssize_t r = recv(conn->fd, conn->read_buf + conn->read_idx,
-                     VIBE_READ_BUFFER_SIZE - conn->read_idx, 0);
-
-    if (r == 0) {
-      conn->active = false;
-      return;
-    }
-    if (r < 0) {
-      if (errno != EAGAIN && errno != EWOULDBLOCK) conn->active = false;
-      return;
-    }
-
-    conn->read_idx += r;
-    bool grabbed_data = false;
-
-    while (conn->read_idx >= 4) {
-      uint32_t net_len;
-      memcpy(&net_len, conn->read_buf, 4);
-      uint32_t len = ntohl(net_len);
-
-      if (len > 10 * 1024 * 1024) {
-        conn->active = false;
+    if (conn->partial_read_msg) {
+      uint32_t len = conn->partial_read_msg->len;
+      uint32_t remaining = len - conn->partial_read_idx;
+      ssize_t r = recv(conn->fd, conn->partial_read_msg->data_ptr + conn->partial_read_idx, remaining, 0);
+      
+      if (r == 0) { conn->active = false; return; }
+      if (r < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) conn->active = false;
+        if (grabbed_data) vibe_schedule_dirty(conn);
         return;
       }
-      if (conn->read_idx < 4 + len) break;
+      
+      conn->partial_read_idx += r;
+      if (conn->partial_read_idx == len) {
+        vibe_conn_retain(conn);
+        vibe_queue_list_push(batch, &conn->partial_read_msg->qnode);
+        conn->partial_read_msg = NULL;
+        conn->partial_read_idx = 0;
+        grabbed_data = true;
+      }
+    } else {
+      ssize_t r = recv(conn->fd, conn->read_buf + conn->read_idx,
+                       VIBE_READ_BUFFER_SIZE - conn->read_idx, 0);
 
-      vibe_node_t* node = vibe_alloc_node(len);
-      if (!node) {
-        conn->active = false;
+      if (r == 0) { conn->active = false; return; }
+      if (r < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) conn->active = false;
+        if (grabbed_data) vibe_schedule_dirty(conn);
         return;
       }
 
-      node->type = VIBE_EVT_DATA;
-      node->conn = conn;
-      node->len = len;
-      node->data_ptr = node->inline_data;
-      memcpy(node->data_ptr, conn->read_buf + 4, len);
+      conn->read_idx += r;
 
-      vibe_conn_retain(conn);
-      vibe_queue_list_push(batch, &node->qnode);
-      grabbed_data = true;
+      while (conn->read_idx >= 4) {
+        uint32_t net_len;
+        memcpy(&net_len, conn->read_buf, 4);
+        uint32_t len = ntohl(net_len);
 
-      size_t frame_size = 4 + len;
-      memmove(conn->read_buf, conn->read_buf + frame_size,
-              conn->read_idx - frame_size);
-      conn->read_idx -= frame_size;
-    }
-
-    if (grabbed_data) {
-      vibe_schedule_dirty(conn);
+        if (len > 10 * 1024 * 1024) {
+          conn->active = false;
+          return;
+        }
+        
+        if (conn->read_idx < 4 + len) {
+            vibe_node_t* node = vibe_alloc_node(len);
+            if (!node) { conn->active = false; return; }
+            node->type = VIBE_EVT_DATA;
+            node->conn = conn;
+            node->len = len;
+            node->data_ptr = node->inline_data;
+            
+            uint32_t available_payload = conn->read_idx - 4;
+            memcpy(node->data_ptr, conn->read_buf + 4, available_payload);
+            
+            conn->read_idx = 0;
+            conn->partial_read_msg = node;
+            conn->partial_read_idx = available_payload;
+            break;
+        } else {
+            vibe_node_t* node = vibe_alloc_node(len);
+            if (!node) { conn->active = false; return; }
+            node->type = VIBE_EVT_DATA;
+            node->conn = conn;
+            node->len = len;
+            node->data_ptr = node->inline_data;
+            memcpy(node->data_ptr, conn->read_buf + 4, len);
+            
+            vibe_conn_retain(conn);
+            vibe_queue_list_push(batch, &node->qnode);
+            grabbed_data = true;
+            
+            size_t frame_size = 4 + len;
+            memmove(conn->read_buf, conn->read_buf + frame_size, conn->read_idx - frame_size);
+            conn->read_idx -= frame_size;
+        }
+      }
     }
   }
 }
@@ -1500,7 +1537,7 @@ bool vibe_cast(vibe_conn_t** conns, int count, const void* data, uint32_t len) {
   chunk->len = len;
   memcpy(chunk->data, data, len);
 
-  atomic_store(&chunk->ref_count, 0);
+  atomic_store(&chunk->ref_count, count);
   int success_count = 0;
 
   for (int i = 0; i < count; i++) {
@@ -1529,13 +1566,13 @@ bool vibe_cast(vibe_conn_t** conns, int count, const void* data, uint32_t len) {
     success_count++;
   }
 
-  if (success_count > 0) {
-    atomic_fetch_add(&chunk->ref_count, success_count);
-    return true;
-  } else {
-    free(chunk);
-    return false;
+  if (success_count < count) {
+    if (atomic_fetch_sub(&chunk->ref_count, count - success_count) == (count - success_count)) {
+       free(chunk);
+    }
   }
+
+  return success_count > 0;
 }
 
 bool vibe_send(vibe_conn_t* conn, const void* data, uint32_t len) {
