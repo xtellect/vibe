@@ -1,0 +1,37 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Example binaries (built by `make`)
+examples/chat_server
+examples/ping_client
+examples/firehose
+examples/telemetry_sink
+
+# Debug / coverage
+*.dSYM/
+*.gcno
+*.gcda
+*.gcov
+core
+core.*
+vgcore.*
+perf.data
+perf.data.old
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local
+.cache/
+compile_commands.json
