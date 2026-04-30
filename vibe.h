@@ -134,7 +134,7 @@ static inline void vibe_dial(vibe_hub_t* hub, const char* address) {
 /**
  * Check the inbox (Poll).
  * Returns a linked-list batch of events, or NULL if empty.
- * Non-blocking (wait-free consumer).
+ * Non-blocking (lock-free single-consumer drain).
  */
 static inline vibe_msg_t* vibe_poll(vibe_hub_t* hub) { return vibe_recv(hub); }
 
@@ -155,7 +155,7 @@ static inline bool vibe_send_msg(vibe_conn_t* conn, const void* data,
 
 /**
  * Broadcast (Multicast) to multiple connections.
- * Uses zero-copy ref-counting internally for maximum efficiency.
+ * Uses single-copy ref-counting internally for maximum efficiency.
  */
 static inline bool vibe_multicast(vibe_conn_t** conns, int count,
                                   const void* data, uint32_t len) {
@@ -982,9 +982,10 @@ static inline bool vibe_queue_producer_commit(
 
 enum {
   VIBE_READ_BUFFER_SIZE = 8192,
-  VIBE_PROTO_HEADER_SIZE = 4,
-  VIBE_MAX_MSG_SIZE = 2U * 1024 * 1024 * 1024 /* 2GB */
+  VIBE_PROTO_HEADER_SIZE = 4
 };
+
+#define VIBE_MAX_MSG_SIZE (2U * 1024 * 1024 * 1024) /* 2GB */
 
 #ifndef VIBE_MAX_EPOLL_EVENTS
 #define VIBE_MAX_EPOLL_EVENTS 128
@@ -1025,7 +1026,7 @@ struct vibe_connection {
   int fd;
   atomic_int ref_count;
   atomic_int is_dirty;
-  bool active;
+  atomic_bool active;
   bool is_listener;
   struct vibe_queue_injector outbox;
   atomic_size_t pending_bytes;
@@ -1040,7 +1041,7 @@ struct vibe_connection {
 struct vibe_net_ctx {
   int epoll_fd;
   int notify_fd;
-  volatile bool running;
+  atomic_bool running;
   pthread_t io_thread;
   struct vibe_queue_injector inbox;
   struct vibe_queue_injector dirty_queue;
@@ -1065,6 +1066,18 @@ static void vibe_conn_release(vibe_conn_t* conn) {
       if (conn->partial_msg->out.chunk) vibe_chunk_release(conn->partial_msg->out.chunk);
       vibe_free_node(conn->partial_msg);
     }
+    
+    vibe_queue_consumer c = vibe_queue_consumer_acquire(&conn->outbox);
+    if (c) {
+      struct vibe_queue_node* qn;
+      while ((qn = vibe_queue_consumer_pop(&c, &conn->outbox))) {
+        vibe_node_t* msg = VIBE_CONTAINER_OF(vibe_node_t, qnode, qn);
+        if (msg->out.chunk) vibe_chunk_release(msg->out.chunk);
+        vibe_free_node(msg);
+      }
+      vibe_queue_consumer_release(c, &conn->outbox);
+    }
+
     free(conn);
   }
 }
@@ -1193,7 +1206,7 @@ static void vibe_handle_write(vibe_conn_t* conn) {
       ssize_t n = sendmsg(conn->fd, &mh, MSG_NOSIGNAL);
       if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-        conn->active = false;
+        atomic_store_explicit(&conn->active, false, memory_order_release);
         return;
       }
 
@@ -1239,9 +1252,9 @@ static void vibe_handle_read(vibe_conn_t* conn, struct vibe_queue_list* batch) {
       uint32_t remaining = len - conn->partial_read_idx;
       ssize_t r = recv(conn->fd, conn->partial_read_msg->data_ptr + conn->partial_read_idx, remaining, 0);
       
-      if (r == 0) { conn->active = false; return; }
+      if (r == 0) { atomic_store_explicit(&conn->active, false, memory_order_release); return; }
       if (r < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) conn->active = false;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) atomic_store_explicit(&conn->active, false, memory_order_release);
         if (grabbed_data) vibe_schedule_dirty(conn);
         return;
       }
@@ -1258,9 +1271,9 @@ static void vibe_handle_read(vibe_conn_t* conn, struct vibe_queue_list* batch) {
       ssize_t r = recv(conn->fd, conn->read_buf + conn->read_idx,
                        VIBE_READ_BUFFER_SIZE - conn->read_idx, 0);
 
-      if (r == 0) { conn->active = false; return; }
+      if (r == 0) { atomic_store_explicit(&conn->active, false, memory_order_release); return; }
       if (r < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) conn->active = false;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) atomic_store_explicit(&conn->active, false, memory_order_release);
         if (grabbed_data) vibe_schedule_dirty(conn);
         return;
       }
@@ -1273,13 +1286,13 @@ static void vibe_handle_read(vibe_conn_t* conn, struct vibe_queue_list* batch) {
         uint32_t len = ntohl(net_len);
 
         if (len > 10 * 1024 * 1024) {
-          conn->active = false;
+          atomic_store_explicit(&conn->active, false, memory_order_release);
           return;
         }
         
         if (conn->read_idx < 4 + len) {
             vibe_node_t* node = vibe_alloc_node(len);
-            if (!node) { conn->active = false; return; }
+            if (!node) { atomic_store_explicit(&conn->active, false, memory_order_release); return; }
             node->type = VIBE_EVT_DATA;
             node->conn = conn;
             node->len = len;
@@ -1294,7 +1307,7 @@ static void vibe_handle_read(vibe_conn_t* conn, struct vibe_queue_list* batch) {
             break;
         } else {
             vibe_node_t* node = vibe_alloc_node(len);
-            if (!node) { conn->active = false; return; }
+            if (!node) { atomic_store_explicit(&conn->active, false, memory_order_release); return; }
             node->type = VIBE_EVT_DATA;
             node->conn = conn;
             node->len = len;
@@ -1380,20 +1393,20 @@ static void* vibe_io_loop(void* arg) {
             socklen_t l = sizeof(err);
             getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &l);
             if (err == 0) {
-              conn->active = true;
+              atomic_store_explicit(&conn->active, true, memory_order_release);
               vibe_node_t* en = vibe_alloc_node(0);
               en->type = VIBE_EVT_CONNECTED;
               en->conn = conn;
               vibe_conn_retain(conn);
               vibe_queue_list_push(&batch, &en->qnode);
             } else {
-              conn->active = false;
+              atomic_store_explicit(&conn->active, false, memory_order_release);
             }
           }
-          if (conn->active) vibe_handle_write(conn);
+          if (atomic_load_explicit(&conn->active, memory_order_acquire)) vibe_handle_write(conn);
         }
-        if ((ev & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) || !conn->active) {
-          conn->active = false;
+        if ((ev & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) || !atomic_load_explicit(&conn->active, memory_order_acquire)) {
+          atomic_store_explicit(&conn->active, false, memory_order_release);
           epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
           vibe_node_t* en = vibe_alloc_node(0);
           en->type = VIBE_EVT_DISCONNECTED;
@@ -1410,7 +1423,7 @@ static void* vibe_io_loop(void* arg) {
       struct vibe_queue_node* dn;
       while ((dn = vibe_queue_consumer_pop(&dc, &ctx->dirty_queue))) {
         vibe_conn_t* dconn = VIBE_CONTAINER_OF(vibe_conn_t, dirty_node, dn);
-        if (dconn->active) vibe_handle_write(dconn);
+        if (atomic_load_explicit(&dconn->active, memory_order_acquire)) vibe_handle_write(dconn);
         vibe_conn_release(dconn);
       }
       vibe_queue_consumer_release(dc, &ctx->dirty_queue);
@@ -1423,7 +1436,7 @@ static void* vibe_io_loop(void* arg) {
 
 vibe_hub_t* vibe_open(void) {
   vibe_hub_t* ctx = calloc(1, sizeof(vibe_hub_t));
-  ctx->running = true;
+  atomic_store_explicit(&ctx->running, true, memory_order_release);
   ctx->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   ctx->notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
@@ -1437,7 +1450,7 @@ vibe_hub_t* vibe_open(void) {
 }
 
 void vibe_close(vibe_hub_t* ctx) {
-  ctx->running = false;
+  atomic_store_explicit(&ctx->running, false, memory_order_release);
   uint64_t one = 1;
   if (write(ctx->notify_fd, &one, 8)) {
   }
@@ -1475,7 +1488,7 @@ bool vibe_bind(vibe_hub_t* ctx, const char* addr) {
 
   vibe_conn_t* conn = calloc(1, sizeof(vibe_conn_t));
   conn->fd = fd;
-  conn->active = true;
+  atomic_store_explicit(&conn->active, true, memory_order_release);
   conn->is_listener = true;
   conn->ctx = ctx;
   atomic_store(&conn->ref_count, 1);
@@ -1507,7 +1520,7 @@ void vibe_connect(vibe_hub_t* ctx, const char* addr) {
 
   vibe_conn_t* conn = calloc(1, sizeof(vibe_conn_t));
   conn->fd = fd;
-  conn->active = false;
+  atomic_store_explicit(&conn->active, false, memory_order_release);
   conn->ctx = ctx;
   atomic_store(&conn->ref_count, 1);
 
@@ -1522,14 +1535,13 @@ void vibe_connect(vibe_hub_t* ctx, const char* addr) {
 
 void vibe_disconnect(vibe_conn_t* conn) {
   if (conn) {
-    conn->active = false;
+    atomic_store_explicit(&conn->active, false, memory_order_release);
     if (conn->fd >= 0) shutdown(conn->fd, SHUT_RDWR);
-    vibe_conn_release(conn);
   }
 }
 
 bool vibe_cast(vibe_conn_t** conns, int count, const void* data, uint32_t len) {
-  if (count == 0) return true;
+  if (count <= 0 || !conns) return count == 0;
 
   vibe_chunk_t* chunk = malloc(sizeof(vibe_chunk_t) + len);
   if (!chunk) return false;
@@ -1542,16 +1554,30 @@ bool vibe_cast(vibe_conn_t** conns, int count, const void* data, uint32_t len) {
 
   for (int i = 0; i < count; i++) {
     vibe_conn_t* c = conns[i];
+    if (!c) continue;
 
-    size_t pending =
-        atomic_load_explicit(&c->pending_bytes, memory_order_relaxed);
-    if (pending > VIBE_MAX_PENDING_BYTES) {
-      continue;
+    size_t wire_len = (size_t)len + VIBE_PROTO_HEADER_SIZE;
+    size_t old = atomic_load_explicit(&c->pending_bytes, memory_order_relaxed);
+    bool rejected = false;
+    for (;;) {
+      if (old > VIBE_MAX_PENDING_BYTES || wire_len > VIBE_MAX_PENDING_BYTES - old) {
+        rejected = true;
+        break;
+      }
+      if (atomic_compare_exchange_weak_explicit(
+              &c->pending_bytes, &old, old + wire_len,
+              memory_order_acq_rel, memory_order_relaxed)) {
+        break;
+      }
     }
-
-    atomic_fetch_add_explicit(&c->pending_bytes, len, memory_order_relaxed);
+    if (rejected) continue;
 
     vibe_node_t* node = vibe_alloc_node(0);
+    if (!node) {
+      atomic_fetch_sub_explicit(&c->pending_bytes, wire_len, memory_order_relaxed);
+      continue;
+    }
+    
     node->type = VIBE_EVT_DATA;
     node->out.chunk = chunk;
     node->out.header_off = 0;
@@ -1567,7 +1593,7 @@ bool vibe_cast(vibe_conn_t** conns, int count, const void* data, uint32_t len) {
   }
 
   if (success_count < count) {
-    if (atomic_fetch_sub(&chunk->ref_count, count - success_count) == (count - success_count)) {
+    if (atomic_fetch_sub(&chunk->ref_count, (uintptr_t)(count - success_count)) == (uintptr_t)(count - success_count)) {
        free(chunk);
     }
   }
